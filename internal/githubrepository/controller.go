@@ -38,6 +38,10 @@ type Controller struct {
 	// we'll be sharing data between several goroutines - the controller and
 	// callback server. This channel is to share information between the two.
 	hooksChan chan callbackHook
+
+	// watcher checks the Github repo for updates if a ReconciliationPeriodSeconds
+	// is defined in the spec.
+	watcher reconciliationRepoWatcher
 }
 
 type webhookClient interface {
@@ -87,6 +91,8 @@ func (c *Controller) Run() error {
 	go srv.start(c.cfg.CallbackPort)
 
 	log.Printf("Starting controller...")
+
+	c.watcher.start(ctx)
 
 	go c.run(ctx)
 
@@ -194,6 +200,9 @@ func (c *Controller) syncPolicy(obj interface{}) error {
 		// no change needed
 		return nil
 	}
+
+	period := time.Duration(ghp.Spec.ReconciliationPeriodSeconds)
+	c.watcher.update(period)
 
 	// need to specify types again until we resolve the mapping issue
 	ghp.TypeMeta = metav1.TypeMeta{
@@ -560,4 +569,39 @@ func getGitHubClient(ctx context.Context, cl getClient, namespace, name string) 
 	)
 	tc := oauth2.NewClient(ctx, ts)
 	return github.NewClient(tc), nil
+}
+
+// reconciliationRepoWatcher is responsible to periodically check the GitHub repo for changes.
+// If new changes happens, the watcher tries to do a release follow the same path as a webhook would.
+type reconciliationRepoWatcher struct {
+	seconds time.Duration
+}
+
+// start creates a goroutine that checks whether the watcher should fetch the repo releases data.
+// A single ticker is used to allow for easy change of periods without resetting when the last check
+// occurred.
+func (w *reconciliationRepoWatcher) start(ctx context.Context) {
+	t := time.NewTicker(1 * time.Second)
+
+	last := time.Now()
+
+	go func() {
+		for {
+			select {
+			case <-t.C:
+				if w.seconds > 0 && last.Add(w.seconds).After(time.Now()) {
+					// TODO: luiz
+					fmt.Println("ping github")
+				}
+			case <-ctx.Done():
+				t.Stop()
+			}
+		}
+	}()
+}
+
+// update can be called to change the watcher's period. It can be called several times with
+// the same value.
+func (w *reconciliationRepoWatcher) update(seconds time.Duration) {
+	w.seconds = seconds
 }

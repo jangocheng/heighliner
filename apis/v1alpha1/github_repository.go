@@ -43,6 +43,10 @@ type GitHubRepositorySpec struct {
 	// ConfigSecret represent the secret that houses the API token to
 	// communicate with the given repository.
 	ConfigSecret corev1.LocalObjectReference `json:"configSecret"`
+
+	// ReconciliationPeriodSeconds is how long the controller should check the Github
+	// repo for changes. If empty, the controller relies only on webhooks for updates.
+	ReconciliationPeriodSeconds int32 `json:"reconciliationPeriodSeconds,omitempty"`
 }
 
 // Slug returns the slug of the repository.
