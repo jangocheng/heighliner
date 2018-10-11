@@ -41,7 +41,7 @@ type Controller struct {
 
 	// watcher checks the Github repo for updates if a ReconciliationPeriodSeconds
 	// is defined in the spec.
-	watcher reconciliationRepoWatcher
+	watcher chan<- *v1alpha1.GitHubRepository
 }
 
 type webhookClient interface {
@@ -92,7 +92,7 @@ func (c *Controller) Run() error {
 
 	log.Printf("Starting controller...")
 
-	c.watcher.start(ctx)
+	c.watcher = newWatcher(ctx, c)
 
 	go c.run(ctx)
 
@@ -189,7 +189,7 @@ func (c *Controller) deleteHooks(obj interface{}) error {
 func (c *Controller) syncPolicy(obj interface{}) error {
 	ghp := obj.(*v1alpha1.GitHubRepository).DeepCopy()
 
-	c.watcher.update(ghp.Spec.ReconciliationPeriodSeconds)
+	c.watcher <- ghp
 
 	hook, err := c.ensureHooks(c.patcher, ghp, c.cfg)
 	if err != nil {
@@ -203,15 +203,19 @@ func (c *Controller) syncPolicy(obj interface{}) error {
 		return nil
 	}
 
+	ghp.Status.Webhook = &v1alpha1.GitHubHook{
+		ID:     hook.ID,
+		Secret: hook.Secret,
+	}
+
+	return c.apply(ghp)
+}
+
+func (c *Controller) apply(ghp *v1alpha1.GitHubRepository) error {
 	// need to specify types again until we resolve the mapping issue
 	ghp.TypeMeta = metav1.TypeMeta{
 		Kind:       "GitHubRepository",
 		APIVersion: "hlnr.io/v1alpha1",
-	}
-
-	ghp.Status.Webhook = &v1alpha1.GitHubHook{
-		ID:     hook.ID,
-		Secret: hook.Secret,
 	}
 
 	// update the status
@@ -573,14 +577,26 @@ func getGitHubClient(ctx context.Context, cl getClient, namespace, name string) 
 // reconciliationRepoWatcher is responsible to periodically check the GitHub repo for changes.
 // If new changes happens, the watcher tries to do a release follow the same path as a webhook would.
 type reconciliationRepoWatcher struct {
-	seconds time.Duration
+	seconds    time.Duration
+	controller *Controller
+	ghp        *v1alpha1.GitHubRepository
+}
+
+func newWatcher(ctx context.Context, c *Controller) chan<- *v1alpha1.GitHubRepository {
+	w := &reconciliationRepoWatcher{
+		controller: c,
+	}
+
+	return w.start(ctx)
 }
 
 // start creates a goroutine that checks whether the watcher should fetch the repo releases data.
 // A single ticker is used to allow for easy change of periods without resetting when the last check
 // occurred.
-func (w *reconciliationRepoWatcher) start(ctx context.Context) {
+func (w *reconciliationRepoWatcher) start(ctx context.Context) chan<- *v1alpha1.GitHubRepository {
 	log.Println("Starting reconciliation repo watcher")
+
+	sync := make(chan *v1alpha1.GitHubRepository)
 
 	t := time.NewTicker(1 * time.Second)
 
@@ -594,21 +610,24 @@ func (w *reconciliationRepoWatcher) start(ctx context.Context) {
 				now := time.Now()
 
 				if w.seconds > 0 && now.After(next) {
-					// TODO: luiz
-					fmt.Println("ping github")
-
+					w.fetchReleases()
 					last = now
 				}
+			case ghp := <-sync:
+				w.update(ghp)
 			case <-ctx.Done():
 				t.Stop()
 			}
 		}
 	}()
+
+	return sync
 }
 
 // update can be called to change the watcher's period. It can be called several times with
 // the same value.
-func (w *reconciliationRepoWatcher) update(period int32) {
+func (w *reconciliationRepoWatcher) update(ghp *v1alpha1.GitHubRepository) {
+	period := ghp.Spec.ReconciliationPeriodSeconds
 	seconds := time.Duration(period) * time.Second
 
 	if seconds == w.seconds {
@@ -616,10 +635,55 @@ func (w *reconciliationRepoWatcher) update(period int32) {
 	}
 
 	if seconds == 0 {
-		log.Println("Stop watching for github changes")
+		log.Println("Stop watching for GitHub changes")
 	} else {
-		log.Printf("Watching for github changes every %d seconds", period)
+		log.Printf("Watching for GitHub changes every %d seconds", period)
 	}
 
 	w.seconds = seconds
+}
+
+func (w *reconciliationRepoWatcher) fetchReleases() {
+	ctx := context.Background()
+
+	ghp := w.ghp
+	patcher := w.controller.patcher
+
+	authToken, err := getSecretAuthToken(patcher, ghp.Namespace, ghp.Spec.ConfigSecret.Name)
+	if err != nil {
+		log.Printf("Error getting secret %s", err.Error())
+		return
+	}
+
+	ts := oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: authToken},
+	)
+	tc := oauth2.NewClient(ctx, ts)
+	client := github.NewClient(tc)
+
+	repo := ghp.Spec
+
+	ghReleases, _, err := client.Repositories.ListReleases(ctx, repo.Owner, repo.Repo, nil)
+	if err != nil {
+		log.Printf("Error fetching GitHub releases %s", err.Error())
+		return
+	}
+
+	var releases []v1alpha1.GitHubRelease
+
+	for _, release := range ghReleases {
+		r, active := convertRelease(release)
+		if !active {
+			continue
+		}
+
+		releases = append(releases, *r)
+	}
+
+	// TODO: luiz get opened PRs as well
+
+	ghp.Status.Releases = releases
+
+	// already logged
+	_ = w.controller.apply(ghp)
 }

@@ -253,26 +253,32 @@ func getOfficialRelease(payload []byte) (*v1alpha1.GitHubRelease, bool, error) {
 		return nil, false, err
 	}
 
-	if *re.Release.Draft {
-		return nil, false, nil
+	release, active := convertRelease(re.Release)
+
+	return release, active, nil // There's no webhook for release deletion
+}
+
+func convertRelease(release *github.RepositoryRelease) (*v1alpha1.GitHubRelease, bool) {
+	if release.Draft == nil || *release.Draft {
+		return nil, false
 	}
 
 	lvl := v1alpha1.SemVerLevelRelease
-	if re.Release.Prerelease != nil && *re.Release.Prerelease {
+	if release.Prerelease != nil && *release.Prerelease {
 		lvl = v1alpha1.SemVerLevelReleaseCandidate
 	}
 
-	name := *re.Release.TagName
-	if re.Release.Name != nil {
-		name = *re.Release.Name
+	name := *release.TagName
+	if release.Name != nil {
+		name = *release.Name
 	}
 
 	return &v1alpha1.GitHubRelease{
 		Name:        name,
-		Tag:         *re.Release.TagName,
+		Tag:         *release.TagName,
 		Level:       lvl,
-		ReleaseTime: releaseTimeFromGitHubTimestamp(re.Release.PublishedAt),
-	}, true, nil // There's no webhook for release deletion
+		ReleaseTime: releaseTimeFromGitHubTimestamp(release.PublishedAt),
+	}, true
 }
 
 func releaseTimeFromGitHubTimestamp(ts *github.Timestamp) metav1.Time {
