@@ -189,6 +189,8 @@ func (c *Controller) deleteHooks(obj interface{}) error {
 func (c *Controller) syncPolicy(obj interface{}) error {
 	ghp := obj.(*v1alpha1.GitHubRepository).DeepCopy()
 
+	c.watcher.update(ghp.Spec.ReconciliationPeriodSeconds)
+
 	hook, err := c.ensureHooks(c.patcher, ghp, c.cfg)
 	if err != nil {
 		log.Printf("Could not ensure GitHub hooks for %s (%s): %s", ghp.Spec.Slug(), ghp.Namespace, err)
@@ -200,9 +202,6 @@ func (c *Controller) syncPolicy(obj interface{}) error {
 		// no change needed
 		return nil
 	}
-
-	period := time.Duration(ghp.Spec.ReconciliationPeriodSeconds)
-	c.watcher.update(period)
 
 	// need to specify types again until we resolve the mapping issue
 	ghp.TypeMeta = metav1.TypeMeta{
@@ -581,6 +580,8 @@ type reconciliationRepoWatcher struct {
 // A single ticker is used to allow for easy change of periods without resetting when the last check
 // occurred.
 func (w *reconciliationRepoWatcher) start(ctx context.Context) {
+	log.Println("Starting reconciliation repo watcher")
+
 	t := time.NewTicker(1 * time.Second)
 
 	last := time.Now()
@@ -589,9 +590,14 @@ func (w *reconciliationRepoWatcher) start(ctx context.Context) {
 		for {
 			select {
 			case <-t.C:
-				if w.seconds > 0 && last.Add(w.seconds).After(time.Now()) {
+				next := last.Add(w.seconds)
+				now := time.Now()
+
+				if w.seconds > 0 && now.After(next) {
 					// TODO: luiz
 					fmt.Println("ping github")
+
+					last = now
 				}
 			case <-ctx.Done():
 				t.Stop()
@@ -602,6 +608,18 @@ func (w *reconciliationRepoWatcher) start(ctx context.Context) {
 
 // update can be called to change the watcher's period. It can be called several times with
 // the same value.
-func (w *reconciliationRepoWatcher) update(seconds time.Duration) {
+func (w *reconciliationRepoWatcher) update(period int32) {
+	seconds := time.Duration(period) * time.Second
+
+	if seconds == w.seconds {
+		return
+	}
+
+	if seconds == 0 {
+		log.Println("Stop watching for github changes")
+	} else {
+		log.Printf("Watching for github changes every %d seconds", period)
+	}
+
 	w.seconds = seconds
 }
